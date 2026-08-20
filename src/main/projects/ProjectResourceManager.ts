@@ -13,13 +13,21 @@ import type {
 const SKILL_FILE = "SKILL.md";
 
 type ProjectProvider = (projectId: string) => Project | undefined;
+type ProjectPathResolver = (project: Project) => string;
 
 /**
  * 管理单个项目目录内的 pi 资源。
  * 仅扫描/删除项目目录下的 .pi/.agents 资源，避免把全局 skill/extension 混入项目级弹框。
  */
 export class ProjectResourceManager {
-	constructor(private readonly getProject: ProjectProvider) {}
+	constructor(
+		private readonly getProject: ProjectProvider,
+		private readonly resolveProjectPath: ProjectPathResolver = (project) => project.path,
+	) {}
+
+	private projectRoot(project: Project): string {
+		return this.resolveProjectPath(project);
+	}
 
 	async list(projectId: string): Promise<ProjectResourceListResult> {
 		const project = this.requireProject(projectId);
@@ -92,7 +100,7 @@ export class ProjectResourceManager {
 		const project = this.requireProject(projectId);
 		this.assertInsideProject(project, extensionPath);
 		// 项目级扩展的禁用通过项目的 .pi/settings.json 中的 disabledExtensions 控制
-		const settingsFile = join(project.path, ".pi", "settings.json");
+		const settingsFile = join(this.projectRoot(project), ".pi", "settings.json");
 		let raw = "{}";
 		try { raw = await readFile(settingsFile, "utf8"); } catch {}
 		const settings = JSON.parse(raw);
@@ -176,13 +184,13 @@ export class ProjectResourceManager {
 	}
 
 	private async listExtensions(project: Project): Promise<PiExtensionSummary[]> {
-		const extensionsDir = join(project.path, ".pi", "extensions");
+		const extensionsDir = join(this.projectRoot(project), ".pi", "extensions");
 		const entries = await readdir(extensionsDir, { withFileTypes: true }).catch(() => []);
 		const result: PiExtensionSummary[] = [];
 		// 读取项目级 disabledExtensions
 		let disabledExts = new Set<string>();
 		try {
-			const raw = await readFile(join(project.path, ".pi", "settings.json"), "utf8");
+			const raw = await readFile(join(this.projectRoot(project), ".pi", "settings.json"), "utf8");
 			const settings = JSON.parse(raw);
 			disabledExts = new Set(settings.disabledExtensions ?? []);
 		} catch {}
@@ -218,13 +226,13 @@ export class ProjectResourceManager {
 			{
 				id: "project-pi",
 				label: ".pi/skills",
-				path: join(project.path, ".pi", "skills"),
+				path: join(this.projectRoot(project), ".pi", "skills"),
 				rootMarkdownEnabled: true,
 			},
 			{
 				id: "project-agents",
 				label: ".agents/skills",
-				path: join(project.path, ".agents", "skills"),
+				path: join(this.projectRoot(project), ".agents", "skills"),
 				rootMarkdownEnabled: false,
 			},
 		];
@@ -284,7 +292,7 @@ export class ProjectResourceManager {
 	}
 
 	private assertInsideProject(project: Project, targetPath: string) {
-		const root = resolve(project.path);
+		const root = resolve(this.projectRoot(project));
 		const target = resolve(targetPath);
 		const rel = relative(root, target);
 		// 所有删除/创建都必须落在当前项目目录内，防止 renderer 传入任意路径误删全局资源。

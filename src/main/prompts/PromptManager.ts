@@ -8,7 +8,7 @@ import type {
 	PiPromptTemplateListResult,
 	PiPromptTemplateSummary,
 } from "../../shared/types";
-import type { WslEnvironment } from "../wsl/WslPaths";
+import { parseWslUncPath, toWindowsHostPath, type WslEnvironment } from "../wsl/WslPaths";
 
 function makeBuiltinContent(name: string, body: string): string {
 	return `---\ndescription: ${name}\n---\n\n${body}`;
@@ -171,6 +171,7 @@ when appropriate. If unsure whether a skill is needed, follow the rule:
  */
 export class PromptManager {
 	private promptsDir: string;
+	private wslEnvironment: WslEnvironment | null = null;
 
 	constructor(home?: string) {
 		this.promptsDir = join(home ?? homedir(), ".pi", "agent", "prompts");
@@ -178,7 +179,24 @@ export class PromptManager {
 
 	/** 将 prompt 目录切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
 	configureWsl(environment: WslEnvironment | null) {
+		this.wslEnvironment = environment;
 		this.promptsDir = join(environment?.windowsHome ?? homedir(), ".pi", "agent", "prompts");
+	}
+
+	/** renderer 保存的是 Linux/UNC 逻辑路径，Windows fs 边界统一使用主机路径。 */
+	private hostPath(path: string): string {
+		if (
+			!this.wslEnvironment ||
+			process.platform !== "win32" ||
+			(!path.startsWith("/") && !parseWslUncPath(path))
+		) {
+			return path;
+		}
+		try {
+			return toWindowsHostPath(path, this.wslEnvironment);
+		} catch {
+			return path;
+		}
 	}
 
 	getDir(): string {
@@ -248,18 +266,19 @@ export class PromptManager {
 	}
 
 	async delete(filePath: string): Promise<void> {
-		if (!filePath.startsWith(this.promptsDir)) {
+		const hostFilePath = this.hostPath(filePath);
+		if (!hostFilePath.startsWith(this.promptsDir)) {
 			throw new Error("只能删除全局 prompt templates 目录下的文件");
 		}
-		if (!existsSync(filePath)) {
+		if (!existsSync(hostFilePath)) {
 			throw new Error("模板文件不存在");
 		}
-		await rm(filePath, { force: true });
+		await rm(hostFilePath, { force: true });
 	}
 
 	/** 扫描项目 .pi/prompts/ 目录下的模板 */
 	async listByProject(projectPath: string): Promise<PiPromptTemplateListResult> {
-		const projectPromptsDir = join(projectPath, ".pi", "prompts");
+		const projectPromptsDir = join(this.hostPath(projectPath), ".pi", "prompts");
 		const entries = await readdir(projectPromptsDir).catch(() => []);
 		const templates: PiPromptTemplateSummary[] = [];
 		for (const entry of entries) {
@@ -290,7 +309,7 @@ export class PromptManager {
 		projectPath: string,
 		input: CreatePiPromptTemplateInput,
 	): Promise<PiPromptTemplateSummary> {
-		const projectPromptsDir = join(projectPath, ".pi", "prompts");
+		const projectPromptsDir = join(this.hostPath(projectPath), ".pi", "prompts");
 		await mkdir(projectPromptsDir, { recursive: true });
 		const name = this.normalizeName(input.name);
 		if (!name) throw new Error("模板名称不能为空，且至少包含一个字母或数字");
@@ -313,7 +332,7 @@ export class PromptManager {
 
 	/** 从项目 .pi/prompts/ 删除模板 */
 	async deleteFromProject(projectPath: string, fileName: string): Promise<void> {
-		const filePath = join(projectPath, ".pi", "prompts", fileName);
+		const filePath = join(this.hostPath(projectPath), ".pi", "prompts", fileName);
 		if (!existsSync(filePath)) throw new Error("模板文件不存在");
 		await rm(filePath, { force: true });
 	}
@@ -327,17 +346,18 @@ export class PromptManager {
 	 * 读取模板原始内容（供编辑器使用）
 	 */
 	async readContent(filePath: string): Promise<string> {
-		return readFile(filePath, "utf8");
+		return readFile(this.hostPath(filePath), "utf8");
 	}
 
 	/**
 	 * 保存模板内容
 	 */
 	async writeContent(filePath: string, content: string): Promise<void> {
-		if (!filePath.startsWith(this.promptsDir)) {
+		const hostFilePath = this.hostPath(filePath);
+		if (!hostFilePath.startsWith(this.promptsDir)) {
 			throw new Error("只能修改全局 prompt templates 目录下的文件");
 		}
-		await writeFile(filePath, content, "utf8");
+		await writeFile(hostFilePath, content, "utf8");
 	}
 
 	private parseFrontmatter(raw: string): Record<string, string> {
@@ -384,7 +404,7 @@ export class PromptManager {
 
 	/** 重命名项目级模板 */
 	async renameInProject(projectPath: string, oldName: string, newName: string): Promise<PiPromptTemplateSummary> {
-		const projectPromptsDir = join(projectPath, ".pi", "prompts");
+		const projectPromptsDir = join(this.hostPath(projectPath), ".pi", "prompts");
 		const normalizedOld = this.normalizeName(oldName);
 		const normalizedNew = this.normalizeName(newName);
 		if (!normalizedOld || !normalizedNew) throw new Error("模板名称不能为空");

@@ -39,18 +39,26 @@ export class PiLocator {
    */
   resolveCommand(customPath?: string, wslEnabled?: boolean, wslDistro?: string, wslUser?: string) {
     const normalizedCustomPath = this.normalizeCustomPath(customPath);
-    // 用户手动指定路径优先，适用于 npm/pnpm/yarn 全局安装、nvm/volta/asdf/mise 等极端情况。
-    // 旧版本可能已保存 pi.ps1；Windows 现在不再调用 PowerShell shim，遇到时忽略并回退自动检测。
-    if (normalizedCustomPath && !this.isUnsupportedPowerShellShim(normalizedCustomPath)) {
-      return normalizedCustomPath;
-    }
-    // 用户显式开启 WSL 时优先使用 WSL 中的 pi，不轮询本地 PATH 中的 Windows 版本
+    // wsl:// 是显式的运行目标，优先保留；普通本地路径不能覆盖已启用的 WSL
+    // 模式，否则设置页残留的 Windows pi.cmd 会把 Agent 静默切回宿主机。
+    if (normalizedCustomPath?.startsWith("wsl://")) return normalizedCustomPath;
     if (wslEnabled && process.platform === "win32" && wslDistro && wslUser) {
+      const wslCustomPath = this.toWslCustomPath(normalizedCustomPath, wslEnabled, wslDistro, wslUser);
+      if (wslCustomPath) return wslCustomPath;
       const wslCommand = this.resolveWslCommand(wslDistro, wslUser);
       if (wslCommand) return wslCommand;
     }
 
+    // 失效的自定义路径也必须回退自动探测，否则 check() 会一直卡在旧路径上。
     const candidates = this.getCandidates();
+    if (
+      normalizedCustomPath &&
+      !this.isUnsupportedPowerShellShim(normalizedCustomPath) &&
+      !normalizedCustomPath.startsWith("wsl://") &&
+      existsSync(normalizedCustomPath)
+    ) {
+      return normalizedCustomPath;
+    }
     const found = candidates.find(candidate => existsSync(candidate));
     if (found) return found;
     return "pi";
@@ -239,8 +247,14 @@ export class PiLocator {
    * 直接对给定路径执行 --version，绕过 getCandidates 的目录扫描，
    * 适用于用户从终端复制完整路径（如 D:\nodejs\pi.cmd）后手动粘贴的场景。
    */
-  async validateCustomPath(customPath: string): Promise<PiInstallStatus> {
-    const command = this.normalizeCustomPath(customPath);
+  async validateCustomPath(
+    customPath: string,
+    wslEnabled?: boolean,
+    wslDistro?: string,
+    wslUser?: string,
+  ): Promise<PiInstallStatus> {
+    const normalized = this.normalizeCustomPath(customPath);
+    const command = this.toWslCustomPath(normalized, wslEnabled, wslDistro, wslUser) ?? normalized;
     if (!command) {
       return { installed: false, searchedDirs: [], error: "请输入 pi.cmd 或 pi 路径。" };
     }
@@ -248,17 +262,23 @@ export class PiLocator {
     if (command.startsWith("wsl://")) {
       const parsed = this.parseWslUrl(command);
       if (!parsed) return { installed: false, searchedDirs: [], error: "Invalid wsl:// URL" };
-      return this.checkWslCommand(parsed.distro, parsed.user, parsed.piCommand);
+      const status = await this.checkWslCommand(parsed.distro, parsed.user, parsed.piCommand);
+      // 设置页继续显示用户输入的 Linux 路径；wsl:// 只作为运行时内部标记。
+      return { ...status, command: normalized };
     }
     return this.runCheck(command, []);
   }
 
   async check(customPath?: string, wslEnabled?: boolean, wslDistro?: string, wslUser?: string): Promise<PiInstallStatus> {
     const normalizedCustomPath = this.normalizeCustomPath(customPath);
-    if (normalizedCustomPath && this.isUnsupportedPowerShellShim(normalizedCustomPath)) {
+    if (
+      normalizedCustomPath &&
+      this.isUnsupportedPowerShellShim(normalizedCustomPath) &&
+      !(wslEnabled && process.platform === "win32" && wslDistro && wslUser)
+    ) {
       return this.unsupportedPowerShellStatus(normalizedCustomPath, this.getSearchDirs());
     }
-    const command = normalizedCustomPath || this.resolveCommand(customPath, wslEnabled, wslDistro, wslUser);
+    const command = this.resolveCommand(customPath, wslEnabled, wslDistro, wslUser);
     const searchedDirs = this.getSearchDirs();
 
     if (command.startsWith("wsl://")) {
@@ -316,6 +336,25 @@ export class PiLocator {
 
   private isUnsupportedPowerShellShim(command: string) {
     return process.platform === "win32" && command.trim().toLowerCase().endsWith(".ps1");
+  }
+
+  private toWslCustomPath(
+    command: string,
+    wslEnabled?: boolean,
+    wslDistro?: string,
+    wslUser?: string,
+  ): string | null {
+    if (
+      !command ||
+      !wslEnabled ||
+      process.platform !== "win32" ||
+      !wslDistro ||
+      !wslUser ||
+      !command.startsWith("/")
+    ) {
+      return null;
+    }
+    return `wsl://${wslDistro}/${wslUser}/${command}`;
   }
 
   private unsupportedPowerShellStatus(
