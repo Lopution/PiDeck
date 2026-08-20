@@ -9,7 +9,7 @@ import vm from "node:vm";
 
 const require = createRequire(import.meta.url);
 
-function loadPiLocatorModule(platform = process.platform) {
+function loadPiLocatorModule(platform = process.platform, moduleOverrides = {}) {
 	const source = readFileSync("src/main/pi/PiLocator.ts", "utf8");
 	const { outputText } = ts.transpileModule(source, {
 		compilerOptions: {
@@ -27,6 +27,7 @@ function loadPiLocatorModule(platform = process.platform) {
 			platform,
 		},
 		require: (id) => {
+			if (id in moduleOverrides) return moduleOverrides[id];
 			if (id === "electron") {
 				return { app: { getPath: () => tmpdir() } };
 			}
@@ -96,4 +97,23 @@ test("places an explicit WSL cwd before the pi command", () => {
 		["-d", "Ubuntu-24.04", "-u", "root", "--cd", "/root/ba cli", "pi", "--mode", "rpc"],
 	);
 	assert.equal(invocation.wsl.distro, "Ubuntu-24.04");
+});
+
+test("keeps a validated Linux custom path as the persisted WSL setting", async () => {
+	const { PiLocator } = loadPiLocatorModule("win32", {
+		"node:child_process": {
+			execFile: (_command, _args, _options, callback) => callback(null, "0.80.0\n", ""),
+			execFileSync: () => "",
+		},
+	});
+	const locator = new PiLocator();
+
+	assert.equal(
+		locator.resolveCommand("/opt/pi", true, "Ubuntu-24.04", "dev"),
+		"wsl://Ubuntu-24.04/dev//opt/pi",
+	);
+	const result = await locator.validateCustomPath("/opt/pi", true, "Ubuntu-24.04", "dev");
+
+	assert.equal(result.installed, true);
+	assert.equal(result.command, "/opt/pi");
 });

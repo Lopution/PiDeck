@@ -594,7 +594,7 @@ export class SessionScanner {
     const raw = wsl ? await this.readWslFile(filePath) : await readFile(filePath, "utf8");
     const current = await this.readSummary(filePath).catch(() => null);
     const copyName = `${current?.name || "Untitled"} copy`;
-    const targetPath = this.nextCopyPath(filePath, wsl);
+    const targetPath = await this.nextCopyPath(filePath, wsl);
     const meta = JSON.stringify({ sessionName: copyName, copiedFrom: filePath, ts: Date.now() });
     const content = `${meta}\n${raw}`;
 
@@ -801,18 +801,19 @@ export class SessionScanner {
 
   // ── 内部私有方法 ─────────────────────────────────────────────
 
-  private nextCopyPath(filePath: string, wsl: boolean): string {
-    const dir = dirname(filePath);
+  private async nextCopyPath(filePath: string, wsl: boolean): Promise<string> {
+    const dir = wsl ? posixDirname(filePath) : dirname(filePath);
     const ext = extname(filePath) || ".jsonl";
-    const base = basename(filePath, ext);
+    const base = wsl ? posixBasename(filePath, ext) : basename(filePath, ext);
     for (let index = 1; index < 1000; index += 1) {
       const suffix = index === 1 ? "copy" : `copy-${index}`;
-      const candidate = join(dir, `${base}-${suffix}${ext}`);
+      const candidate = wsl
+        ? posixJoin(dir, `${base}-${suffix}${ext}`)
+        : join(dir, `${base}-${suffix}${ext}`);
       // WSL 路径需要通过 wsl.exe 检查文件是否存在
       if (wsl) {
-        // 对于 WSL copy，我们跳过存在性检查（nextCopyPath 在 copy() 中调用，
-        // copy 写入前已经通过递增确保唯一；这里仅保证路径格式正确）
-        return candidate;
+        if (!(await this.existsWslFile(candidate))) return candidate;
+        continue;
       }
       if (!existsSync(candidate)) return candidate;
     }

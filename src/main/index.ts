@@ -143,7 +143,13 @@ import { preparePreloadPath } from "./preloadPath";
 import { AppLogger } from "./logging/AppLogger";
 import { RpcLogger } from "./logging/RpcLogger";
 import { resolveWslEnvironment } from "./wsl/WslEnvironment";
-import type { WslEnvironment } from "./wsl/WslPaths";
+import {
+	normalizeSelectedWslProjectPath,
+	parseWslUncPath,
+	toWindowsHostPath,
+	toWslLinuxPath,
+	type WslEnvironment,
+} from "./wsl/WslPaths";
 import {
 	detectExternalEditors,
 	listConfiguredExternalEditors,
@@ -194,6 +200,40 @@ let appLogger: AppLogger;
 let rpcLogger: RpcLogger;
 let feishuBridge: FeishuBridge | null = null;
 let activeWslEnvironment: WslEnvironment | null = null;
+
+type ProjectPathLike = { path: string; environment?: string };
+
+/** 当前 WSL 环境的最小路径上下文；settings 尚未加载时不做任何转换。 */
+function currentWslPathEnvironment(): Pick<WslEnvironment, "distro"> | null {
+	const settings = settingsStore?.get();
+	if (!settings?.wslEnabled || !settings.wslDistro) return null;
+	return activeWslEnvironment ?? { distro: settings.wslDistro };
+}
+
+/** Windows 主进程访问 renderer/项目传入的 WSL 路径时，统一转换到 host path。 */
+function hostPath(path: string): string {
+	if (!path || process.platform !== "win32") return path;
+	const environment = currentWslPathEnvironment();
+	if (
+		!environment ||
+		(!path.startsWith("/") && !parseWslUncPath(path))
+	) {
+		return path;
+	}
+	return toWindowsHostPath(path, environment);
+}
+
+function projectHostPath(project: ProjectPathLike): string {
+	return project.environment === "wsl" ? hostPath(project.path) : project.path;
+}
+
+/** worktree 等 host API 返回的路径重新写回 projects.json 时保持 WSL 逻辑路径。 */
+function projectStoredPath(path: string, project: ProjectPathLike): string {
+	if (project.environment !== "wsl") return path;
+	const environment = currentWslPathEnvironment();
+	if (!environment) return path;
+	return normalizeSelectedWslProjectPath(path, environment);
+}
 
 /**
  * WSL HOME 只在这里解析一次，再把同一个环境对象下发给所有文件边界消费者。
@@ -1334,7 +1374,7 @@ function registerIpc() {
 		ipcChannels.editorsOpenProject,
 		async (_event, editor: ExternalEditor, projectPath: string) => {
 			// 只接收已检测到的编辑器配置；打开项目不经过 shell 拼接命令,降低路径含空格时失败的概率。
-			await openProjectInEditor(editor, projectPath);
+			await openProjectInEditor(editor, hostPath(projectPath));
 			void appLogger.info("editor", "Project opened in external editor", {
 				editorId: editor.id,
 				editorName: editor.name,
@@ -1426,7 +1466,7 @@ function registerIpc() {
 			// 即将启用时先校验是否 git 仓库；非 git 项目开启工作区模式没有意义，
 			// 只会看到空列表并在创建时报错，这里提前给出明确错误让前端提示用户。
 			if (!existing.worktreeEnabled) {
-				const isRepo = await gitService.isGitRepo(existing.path);
+				const isRepo = await gitService.isGitRepo(projectHostPath(existing));
 				if (!isRepo) {
 					throw new Error("NOT_A_GIT_REPO");
 				}
@@ -1436,11 +1476,12 @@ function registerIpc() {
 			// 开启 worktree 模式时，自动注册已有的 git worktree
 			if (project.worktreeEnabled) {
 				try {
-					const entries = await worktreeService.list(project.path);
+					const entries = await worktreeService.list(projectHostPath(project));
 					for (const wt of entries) {
+						const storedPath = projectStoredPath(wt.path, project);
 						// findByPath 返回 null 表示未注册
-						if (!projectStore.findByPath(wt.path)) {
-							await projectStore.add(wt.path, projectId);
+						if (!projectStore.findByPath(storedPath)) {
+							await projectStore.add(storedPath, projectId, project.environment);
 						}
 					}
 				} catch {
@@ -1487,27 +1528,11 @@ function registerIpc() {
 	ipcMain.handle(ipcChannels.filesList, async (_event, projectId: string) => {
 		const project = projectStore.get(projectId);
 		if (!project) throw new Error(`Project not found: ${projectId}`);
-		return fileSystemService.listTree(project.path);
+		return fileSystemService.listTree(projectHostPath(project));
 	});
 
-	// 将 WSL Linux 路径转为 Windows 可访问的路径（/mnt/c → C:\，/home/... → \\wsl$\<distro>\...）
-	const toWindowsPath = (linuxPath: string): string => {
-		if (!linuxPath || /^[A-Za-z]:/.test(linuxPath)) return linuxPath; // 已是 Windows 路径
-		// /mnt/c/Users/... → C:\Users\...
-		const mntMatch = linuxPath.match(/^\/mnt\/([a-z])\/(.*)/);
-		if (mntMatch) {
-			return `${mntMatch[1].toUpperCase()}:\\${mntMatch[2].replace(/\//g, '\\')}`;
-		}
-		// /home/user/... → \\wsl$\<distro>\home\user\...
-		const settings = settingsStore.get();
-		if (settings.wslEnabled && settings.wslDistro) {
-			return `\\\\wsl$\\${settings.wslDistro}\\${linuxPath.replace(/^\//, '').replace(/\//g, '\\')}`;
-		}
-		return linuxPath;
-	};
-
 	ipcMain.handle(ipcChannels.filesOpen, async (_event, path: string) => {
-		const error = await shell.openPath(toWindowsPath(path));
+		const error = await shell.openPath(hostPath(path));
 		// Electron 通过返回字符串报告打开失败；显式抛出后前端才能提示路径不存在或系统无法打开。
 		if (error) throw new Error(error);
 	});
@@ -1519,7 +1544,7 @@ function registerIpc() {
 
 	ipcMain.handle(ipcChannels.filesReadContent, async (_event, path: string) => {
 		try {
-			return await readFile(toWindowsPath(path), "utf8");
+			return await readFile(hostPath(path), "utf8");
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 				return "";
@@ -1530,9 +1555,9 @@ function registerIpc() {
 
 	/** 读取本地图片等二进制文件为 data URL，供粘贴资源管理器图片文件时附加到消息。 */
 	ipcMain.handle(ipcChannels.filesReadBase64, async (_event, path: string) => {
-		const hostPath = toWindowsPath(path);
-		const buf = await readFile(hostPath);
-		const ext = hostPath.split(/[\\/]/).pop()?.split(".").pop()?.toLowerCase() ?? "";
+		const resolvedPath = hostPath(path);
+		const buf = await readFile(resolvedPath);
+		const ext = resolvedPath.split(/[\\/]/).pop()?.split(".").pop()?.toLowerCase() ?? "";
 		const mime =
 			ext === "jpg" || ext === "jpeg"
 				? "image/jpeg"
@@ -1547,17 +1572,17 @@ function registerIpc() {
 	});
 
 	ipcMain.handle(ipcChannels.filesWriteContent, async (_event, path: string, content: string) => {
-		await writeFile(path, content, "utf8");
+		await writeFile(hostPath(path), content, "utf8");
 		void appLogger.info("file", "File written", { path, bytes: Buffer.byteLength(content, "utf8") });
 	});
 
 	ipcMain.handle(ipcChannels.filesDelete, async (_event, path: string, recursive?: boolean) => {
-		await fileSystemService.delete(path, recursive);
+		await fileSystemService.delete(hostPath(path), recursive);
 		void appLogger.info("file", "File deleted", { path, recursive: Boolean(recursive) });
 	});
 
 	ipcMain.handle(ipcChannels.filesRename, async (_event, path: string, newName: string) => {
-		const result = await fileSystemService.rename(path, newName);
+		const result = await fileSystemService.rename(hostPath(path), newName);
 		void appLogger.info("file", "File renamed", { path, newName, result });
 		return result;
 	});
@@ -1565,7 +1590,7 @@ function registerIpc() {
 	ipcMain.handle(
 		ipcChannels.filesCreate,
 		async (_event, parentDir: string, name: string, type: "file" | "directory") => {
-			const result = await fileSystemService.create(parentDir, name, type);
+			const result = await fileSystemService.create(hostPath(parentDir), name, type);
 			void appLogger.info("file", "File/folder created", { parentDir, name, type, result });
 			return result;
 		},
@@ -1574,12 +1599,14 @@ function registerIpc() {
 	ipcMain.handle(
 		ipcChannels.filesCopy,
 		async (_event, sourcePaths: string[], targetDir: string) => {
+			const hostTargetDir = hostPath(targetDir);
 			const results: string[] = [];
 			for (const src of sourcePaths) {
 				try {
-					const name = basename(src);
-					const dest = join(targetDir, name);
-					await cp(src, dest, { recursive: true, errorOnExist: false });
+					const hostSrc = hostPath(src);
+					const name = basename(hostSrc);
+					const dest = join(hostTargetDir, name);
+					await cp(hostSrc, dest, { recursive: true, errorOnExist: false });
 					results.push(dest);
 					void appLogger.info("file", "File/folder copied", { src, dest });
 				} catch (error) {
@@ -1594,17 +1621,19 @@ function registerIpc() {
 	ipcMain.handle(
 		ipcChannels.filesMove,
 		async (_event, sourcePaths: string[], targetDir: string) => {
+			const hostTargetDir = hostPath(targetDir);
 			const results: string[] = [];
 			for (const src of sourcePaths) {
 				try {
-					const name = basename(src);
-					const dest = join(targetDir, name);
+					const hostSrc = hostPath(src);
+					const name = basename(hostSrc);
+					const dest = join(hostTargetDir, name);
 					// 先尝试 rename（同设备快），跨设备 fallback 到 cp+rm
 					try {
-						await rename(src, dest);
+						await rename(hostSrc, dest);
 					} catch {
-						await cp(src, dest, { recursive: true });
-						await rm(src, { recursive: true, force: true });
+						await cp(hostSrc, dest, { recursive: true });
+						await rm(hostSrc, { recursive: true, force: true });
 					}
 					results.push(dest);
 					void appLogger.info("file", "File/folder moved", { src, dest });
@@ -1734,7 +1763,7 @@ function registerIpc() {
 	ipcMain.handle(
 		ipcChannels.filesShowInFolder,
 		async (_event, path: string) => {
-			shell.showItemInFolder(toWindowsPath(path));
+			shell.showItemInFolder(hostPath(path));
 		},
 	);
 
@@ -1851,7 +1880,7 @@ function registerIpc() {
 	ipcMain.handle(ipcChannels.gitBranches, async (_event, projectId: string) => {
 		const project = projectStore.get(projectId);
 		if (!project) throw new Error(`Project not found: ${projectId}`);
-		return gitService.getBranches(project.path);
+		return gitService.getBranches(projectHostPath(project));
 	});
 
 	ipcMain.handle(
@@ -1859,7 +1888,7 @@ function registerIpc() {
 		async (_event, projectId: string, branch: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			return gitService.checkout(project.path, branch);
+			return gitService.checkout(projectHostPath(project), branch);
 		},
 	);
 
@@ -1868,7 +1897,7 @@ function registerIpc() {
 		async (_event, projectId: string, branchName: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			return gitService.createBranch(project.path, branchName);
+			return gitService.createBranch(projectHostPath(project), branchName);
 		},
 	);
 
@@ -1877,7 +1906,7 @@ function registerIpc() {
 		ipcChannels.gitOriginalContent,
 		async (_event, filePath: string) => {
 			const maxBytes = Math.max(1, settingsStore.get().maxEditorFileSizeMB) * 1024 * 1024;
-			return gitService.getOriginalContent(filePath, maxBytes);
+			return gitService.getOriginalContent(hostPath(filePath), maxBytes);
 		},
 	);
 
@@ -1886,12 +1915,16 @@ function registerIpc() {
 		async (_event, projectId: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			const entries = await worktreeService.list(project.path);
+			const entries = await worktreeService.list(projectHostPath(project));
+			const storedEntries = entries.map((entry) => ({
+				...entry,
+				path: projectStoredPath(entry.path, project),
+			}));
 			// 每次扫描都同步注册外部新增 worktree，保证侧栏数据和 git 状态一致。
-			for (const wt of entries) {
-				await projectStore.add(wt.path, projectId);
+			for (const wt of storedEntries) {
+				await projectStore.add(wt.path, projectId, project.environment);
 			}
-			return entries;
+			return storedEntries;
 		},
 	);
 
@@ -1900,9 +1933,10 @@ function registerIpc() {
 		async (_event, projectId: string, branchName: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			const info = await worktreeService.create(project.path, projectId, branchName);
-			await projectStore.add(info.path, projectId);
-			return info;
+			const info = await worktreeService.create(projectHostPath(project), projectId, branchName);
+			const storedPath = projectStoredPath(info.path, project);
+			await projectStore.add(storedPath, projectId, project.environment);
+			return { ...info, path: storedPath };
 		},
 	);
 
@@ -1911,19 +1945,21 @@ function registerIpc() {
 		async (_event, projectId: string, worktreePath: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			const ok = await worktreeService.remove(worktreePath, project.path);
+			const hostWorktreePath = hostPath(worktreePath);
+			const hostProjectPath = projectHostPath(project);
+			const ok = await worktreeService.remove(hostWorktreePath, hostProjectPath);
 			const normalizeForCompare = (value: string) => {
 				const resolved = resolve(value);
 				return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 			};
-			const normalizedTarget = normalizeForCompare(worktreePath);
-			const stillInGit = (await worktreeService.list(project.path)).some(
+			const normalizedTarget = normalizeForCompare(hostWorktreePath);
+			const stillInGit = (await worktreeService.list(hostProjectPath)).some(
 				(entry) => normalizeForCompare(entry.path) === normalizedTarget,
 			);
 			// 如果 git 已经没有该 worktree（包括用户在外部删过导致 remove 返回 false），
 			// 也要清理 PiDeck 项目记录，否则重启后会从 projects.json 恢复成“删不掉”。
 			if (ok || !stillInGit) {
-				const child = projectStore.findByPath(worktreePath);
+				const child = projectStore.findByPath(projectStoredPath(hostWorktreePath, project));
 				if (child) await projectStore.remove(child.id);
 				return true;
 			}
@@ -1937,7 +1973,10 @@ function registerIpc() {
 		async (_event, projectId: string, options?: { maxEntries?: number; ref?: string; path?: string; allBranches?: boolean }) => {
 			const project = projectStore.get(projectId);
 			if (!project) return [];
-			return gitService.getCommitLog(project.path, options);
+			const hostOptions = options?.path
+				? { ...options, path: hostPath(options.path) }
+				: options;
+			return gitService.getCommitLog(projectHostPath(project), hostOptions);
 		},
 	);
 
@@ -1946,7 +1985,7 @@ function registerIpc() {
 		async (_event, projectId: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) return [];
-			return gitService.getRefs(project.path);
+			return gitService.getRefs(projectHostPath(project));
 		},
 	);
 
@@ -1955,7 +1994,7 @@ function registerIpc() {
 		async (_event, projectId: string, base: string, target: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			return gitService.compareBranches(project.path, base, target);
+			return gitService.compareBranches(projectHostPath(project), base, target);
 		},
 	);
 
@@ -1964,7 +2003,7 @@ function registerIpc() {
 		async (_event, projectId: string, ref: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) return null;
-			return gitService.getCommitDetail(project.path, ref);
+			return gitService.getCommitDetail(projectHostPath(project), ref);
 		},
 	);
 
@@ -1974,7 +2013,13 @@ function registerIpc() {
 			const project = projectStore.get(projectId);
 			if (!project) return null;
 			const maxBytes = Math.max(1, settingsStore.get().maxEditorFileSizeMB) * 1024 * 1024;
-			return gitService.getCommitFileDiff(project.path, ref, filePath, originalPath, maxBytes);
+			return gitService.getCommitFileDiff(
+				projectHostPath(project),
+				ref,
+				hostPath(filePath),
+				originalPath ? hostPath(originalPath) : originalPath,
+				maxBytes,
+			);
 		},
 	);
 
@@ -1983,7 +2028,7 @@ function registerIpc() {
 		async (_event, projectId: string, ref1: string, ref2: string, filePath: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) return "";
-			return gitService.diffFileBetweenRefs(project.path, ref1, ref2, filePath);
+			return gitService.diffFileBetweenRefs(projectHostPath(project), ref1, ref2, hostPath(filePath));
 		},
 	);
 
@@ -1994,7 +2039,7 @@ function registerIpc() {
 		async (_event, projectId: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) return { merge: [], index: [], workingTree: [], untracked: [] };
-			return gitService.getStatus(project.path);
+			return gitService.getStatus(projectHostPath(project));
 		},
 	);
 
@@ -2004,7 +2049,7 @@ function registerIpc() {
 			const project = projectStore.get(projectId);
 			if (!project) return null;
 			const maxBytes = Math.max(1, settingsStore.get().maxEditorFileSizeMB) * 1024 * 1024;
-			return gitService.getWorkspaceFileDiff(project.path, group, filePath, maxBytes);
+			return gitService.getWorkspaceFileDiff(projectHostPath(project), group, hostPath(filePath), maxBytes);
 		},
 	);
 
@@ -2013,7 +2058,7 @@ function registerIpc() {
 		async (_event, projectId: string, paths: string[]) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.stageFiles(project.path, paths);
+			await gitService.stageFiles(projectHostPath(project), paths.map(hostPath));
 		},
 	);
 
@@ -2022,7 +2067,7 @@ function registerIpc() {
 		async (_event, projectId: string, paths: string[]) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.unstageFiles(project.path, paths);
+			await gitService.unstageFiles(projectHostPath(project), paths.map(hostPath));
 		},
 	);
 
@@ -2031,7 +2076,7 @@ function registerIpc() {
 		async (_event, projectId: string, group: "workingTree" | "untracked", filePath: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.discardFile(project.path, group, filePath);
+			await gitService.discardFile(projectHostPath(project), group, hostPath(filePath));
 		},
 	);
 
@@ -2040,7 +2085,7 @@ function registerIpc() {
 		async (_event, projectId: string, message: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.commit(project.path, message);
+			await gitService.commit(projectHostPath(project), message);
 		},
 	);
 
@@ -2049,7 +2094,7 @@ function registerIpc() {
 		async (_event, projectId: string, hash: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.cherryPick(project.path, hash);
+			await gitService.cherryPick(projectHostPath(project), hash);
 		},
 	);
 
@@ -2058,7 +2103,7 @@ function registerIpc() {
 		async (_event, projectId: string, hash: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.revertCommit(project.path, hash);
+			await gitService.revertCommit(projectHostPath(project), hash);
 		},
 	);
 
@@ -2067,7 +2112,7 @@ function registerIpc() {
 		async (_event, projectId: string, hash: string, mode: "soft" | "mixed" | "hard") => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.resetToCommit(project.path, hash, mode);
+			await gitService.resetToCommit(projectHostPath(project), hash, mode);
 		},
 	);
 
@@ -2076,7 +2121,7 @@ function registerIpc() {
 		async (_event, projectId: string, hash: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.dropCommit(project.path, hash);
+			await gitService.dropCommit(projectHostPath(project), hash);
 		},
 	);
 
@@ -2101,6 +2146,9 @@ function registerIpc() {
 		}
 
 		const settings = settingsStore.get();
+		const wslCwd = settings.wslEnabled && settings.wslDistro && command.startsWith("wsl://")
+			? toWslLinuxPath(projectPath, { distro: settings.wslDistro })
+			: undefined;
 		const invocation = piLocator.createInvocation(command, [
 			"--mode", "rpc",
 			"--no-session",
@@ -2111,19 +2159,22 @@ function registerIpc() {
 			"--no-context-files",
 			"--no-themes",
 			"--thinking", "off",
-		]);
+		], wslCwd ? { wslCwd } : {});
+		const spawnCwd = wslCwd && settings.wslDistro
+			? toWindowsHostPath(projectPath, { distro: settings.wslDistro })
+			: projectPath;
 
-		console.log("[QuickGen] spawning", { command: invocation.command, args: invocation.args, cwd: projectPath });
+		console.log("[QuickGen] spawning", { command: invocation.command, args: invocation.args, cwd: spawnCwd, wslCwd });
 
 		genProcess = spawn(invocation.command, invocation.args, {
-			cwd: projectPath,
+			cwd: spawnCwd,
 			env: piLocator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
 			stdio: ["pipe", "pipe", "pipe"],
 			shell: invocation.shell,
 			windowsHide: true,
 			windowsVerbatimArguments: invocation.windowsVerbatimArguments,
 		});
-		genProcessCwd = projectPath;
+		genProcessCwd = spawnCwd;
 		console.log("[QuickGen] spawned, pid:", genProcess.pid);
 
 		genRpcClient = new PiRpcClient(genProcess.stdin!, genProcess.stdout!);
@@ -2229,7 +2280,8 @@ function registerIpc() {
 				return "";
 			}
 
-			const diff = await gitService.getStagedDiff(project.path, 10000);
+			const hostProjectPath = projectHostPath(project);
+			const diff = await gitService.getStagedDiff(hostProjectPath, 10000);
 			if (!diff.trim()) {
 				console.log("[QuickGen] no staged diff");
 				return "";
@@ -2243,7 +2295,7 @@ function registerIpc() {
 
 			try {
 				console.log("[QuickGen] calling quickGenerate");
-				const result = await quickGenerate(project.path, prompt);
+				const result = await quickGenerate(hostProjectPath, prompt);
 				console.log("[QuickGen] done", { length: result.length });
 				void appLogger?.warn("git", "Generate commit message result", { length: result.length, text: result.slice(0, 100) });
 				return result.trim();
@@ -2261,7 +2313,7 @@ function registerIpc() {
 		async (_event, projectId: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.push(project.path);
+			await gitService.push(projectHostPath(project));
 		},
 	);
 
@@ -2270,7 +2322,7 @@ function registerIpc() {
 		async (_event, projectId: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.pull(project.path);
+			await gitService.pull(projectHostPath(project));
 		},
 	);
 
@@ -2279,7 +2331,7 @@ function registerIpc() {
 		async (_event, projectId: string) => {
 			const project = projectStore.get(projectId);
 			if (!project) throw new Error(`Project not found: ${projectId}`);
-			await gitService.fetch(project.path);
+			await gitService.fetch(projectHostPath(project));
 		},
 	);
 
@@ -2292,15 +2344,16 @@ function registerIpc() {
 			const { promisify } = await import("node:util");
 			const execFileAsync = promisify(execFile);
 			// 初始化仓库并创建 main 分支，生成一个初始空提交
-			await execFileAsync("git", ["init"], { cwd: project.path });
+			const cwd = projectHostPath(project);
+			await execFileAsync("git", ["init"], { cwd });
 			try {
-				await execFileAsync("git", ["checkout", "-b", "main"], { cwd: project.path });
+				await execFileAsync("git", ["checkout", "-b", "main"], { cwd });
 			} catch {
 				// 部分 git 版本在无提交时 checkout -b 可能失败，改用 branch -M
-				await execFileAsync("git", ["branch", "-M", "main"], { cwd: project.path });
+				await execFileAsync("git", ["branch", "-M", "main"], { cwd });
 			}
 			await execFileAsync("git", ["commit", "--allow-empty", "-m", "Initial commit"], {
-				cwd: project.path,
+				cwd,
 				env: { ...process.env, GIT_AUTHOR_NAME: "PiDeck", GIT_AUTHOR_EMAIL: "pideck@local", GIT_COMMITTER_NAME: "PiDeck", GIT_COMMITTER_EMAIL: "pideck@local" },
 			});
 		},
@@ -2456,7 +2509,13 @@ function registerIpc() {
 	ipcMain.handle(
 		ipcChannels.piCheckCustom,
 		async (_event, customPath: string) => {
-			const status = await piLocator.validateCustomPath(customPath);
+			const settings = settingsStore.get();
+			const status = await piLocator.validateCustomPath(
+				customPath,
+				settings.wslEnabled,
+				settings.wslDistro,
+				settings.wslUser,
+			);
 			// 校验通过后持久化归一化后的路径，后续启动 agent 时 PiProcess 会从 settings 读取。
 			// 例如用户粘贴 "D:\\foo\\pi" 时，PiLocator 会返回可执行的 D:\foo\pi.cmd。
 			if (status.installed && status.command) {
@@ -2673,7 +2732,13 @@ function registerIpc() {
 	});
 	ipcMain.handle(ipcChannels.appFeedbackEnvironment, async () => {
 		// 反馈报告只包含诊断必需的运行时版本与 pi 检测结果，不读取配置密钥或会话内容。
-		const pi = await piLocator.check();
+		const settings = settingsStore.get();
+		const pi = await piLocator.check(
+			settings.customPiPath,
+			settings.wslEnabled,
+			settings.wslDistro,
+			settings.wslUser,
+		);
 		return {
 			appVersion: app.getVersion(),
 			platform: process.platform,
@@ -3759,7 +3824,10 @@ app.whenReady().then(async () => {
 		() => settingsStore.get(),
 		(patch) => settingsStore.update(patch),
 	);
-	projectResourceManager = new ProjectResourceManager((projectId) => projectStore.get(projectId));
+	projectResourceManager = new ProjectResourceManager(
+		(projectId) => projectStore.get(projectId),
+		(project) => projectHostPath(project),
+	);
 	agentManager = new AgentManager(
 		(id) => projectStore.get(id),
 		() => mainWindow,
@@ -3798,6 +3866,7 @@ app.whenReady().then(async () => {
 				// 窗口已关闭时静默忽略，避免 pty 后发事件抛 "Object has been destroyed"
 			}
 		},
+		() => settingsStore.get(),
 	);
 
 	// 启动关键路径只等设置加载与 IPC 注册，尽快 createWindow。

@@ -114,6 +114,7 @@ export class ProjectStore {
     if (existing) {
       existing.path = normalizedPath;
       existing.lastOpenedAt = Date.now();
+      if (environment) existing.environment = environment;
       // 外部已有 worktree 可能曾经作为顶级项目加入；开启工作区后需要补上父子关系。
       if (worktreeParentId && existing.id !== worktreeParentId) {
         existing.worktreeParentId = worktreeParentId;
